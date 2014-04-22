@@ -1,0 +1,354 @@
+#!/bin/sh
+#
+#Author:
+##Michael C. Hoffman
+#Date:
+##2013-11-20
+#License:
+##GPLv2
+
+
+#igel_buildmodule
+
+#this module will build a shell module for full customization or
+#pull a package from the appropriate ubuntu release and create a complete
+#igel custom module
+#
+#Requirements:
+##ar binary to be installed (for unpacking deb files)
+##tar binary to be installed
+##gunzip binary to be installed
+
+
+#####global variables==start#####
+progname=$(basename $0)
+#####global variables==end#####
+
+
+#log function to echo statements to stderr
+function log(){
+	#log message to std error
+	echo -e "$*" >&2
+}
+
+#usage function to display how to call this script and exit
+function usage(){
+	echo -e "Usage: ${progname} <-c|-u --igel-name --igel-version> [--ubuntu-name --ubuntu-release]"
+	echo -e "-c                Create a basic template shell directory with a default inf file and deploy.sh file"
+	echo -e "-u                Create an Igel module from an Ubuntu Package (requires --ubuntu-name and --ubuntu-release)"
+	echo -e "--igel-name       Name of Igel Module to create"
+	echo -e "--igel-version    Version Number of Igel Module to create" 
+	echo -e "--ubuntu-package  Ubuntu Package Name to download (Only used with -u option)"
+	echo -e "--ubuntu-release  Ubuntu Release name EX: lucid (Only used with -u option)"
+	echo -e "This program will create a directory in the current working directory from the name given by --igel-name."
+	exit 1
+}
+
+#function build igel module from ubuntu package
+#Arguments:
+##ubuntu_package-string-name of ubuntu package name
+##ubuntu_release-string-release of ubuntu to pull ubuntu_package from
+function igel_ubuntu_module(){
+	local ubuntu_package=$1
+	local ubuntu_release=$2
+
+	local igel_module_tmp="${PWD}/.${igel_module}"
+
+
+	log "INFO: #####igel_ubuntu_module ==start#####"
+	#make the igel_module_tmp directory
+	if [ ! -d ${igel_module_tmp} ]; then
+		log "INFO: igel_ubuntu_module - creating temporary igel_module directory ${igel_module_tmp}"
+		mkdir ${igel_module_tmp}
+		local mkdir_return=$?
+		if [ ${mkdir_return} -ne 0 ]; then
+			log "ERR: igel_ubuntu_module - error creating temporary igel_module directory ${igel_module_tmp}"
+			exit 1
+		fi
+	fi
+
+	#download the ubuntu module
+	local packagename=$(getdeb "${ubuntu_package}" "${ubuntu_release}" "${igel_module_tmp}")
+	if [ $? -ne 0 ]; then
+		log "ERR: Could not getdeb returned error."
+		igel_ubuntu_module_cleanup "${igel_module_tmp}"
+	fi
+
+
+	#unpack the debian module and insert into the igel_module directory
+	unpackdeb "${igel_module_tmp}" "${packagename}"
+	local unpackdeb_return=$?
+	if [ ${unpackdeb_return} -ne 0 ]; then
+		log "ERR: igel_ubuntu_module - could not unpack deb package exiting."
+		igel_ubuntu_module_cleanup "${igel_module_tmp}"
+	fi
+
+	#create the deploy.sh file
+  cat <<EOF > "${igel_module_dir}/deploy.sh"
+#!/bin/sh
+logger -t "${igel_module}_deploy.sh" "Starting ${igel_module} package deploy"
+#ensure that the files are owned by root
+chown -R root:system /custom/${igel_module}/root
+#copy the root files onto the filesystem
+/bin/cp -Rf /custom/${igel_module}/root/* /
+logger -t "${igel_module}_deploy.sh" "Finished ${igel_module} package deploy"
+EOF
+	if [ $? -ne 0 ]; then
+		log "ERR: igel_ubuntu_module - could not create deploy.sh"
+	fi
+	chmod +x "${igel_module_dir}/deploy.sh"
+
+	log "INFO: #####igel_ubuntu_module ==end#####"
+	igel_ubuntu_module_cleanup "${igel_module_tmp}"
+	return 0
+}
+
+#function to clean up igel_ubuntu_module temporary files
+#Arguments:
+##tmpdir-string-full path to temporary module directory
+function igel_ubuntu_module_cleanup(){
+	local tmpdir=$1
+	log "INFO: #####igel_ubuntu_module_cleanup ==start#####"
+	log "INFO: igel_ubuntu_module_cleanup - removing temporary directory ${tmpdir}"
+	rm -Rf ${tmpdir}
+	log "INFO: #####igel_ubuntu_module_cleanup ==end#####"
+}
+
+#function getdeb download deb file from ubuntu
+#Arguments:
+##ubuntu_package-string-name of ubuntu package
+##ubuntu_release-string-name of ubuntu release
+##download_dir-string-location to download deb package to
+#Outputs:
+##packagename
+function getdeb(){
+	local ubuntu_package=$1
+	local ubuntu_release=$2
+	local download_dir=$3
+	local ubuntu_package_url="http://packages.ubuntu.com"
+	local ubuntu_packageinfo_url="${ubuntu_package_url}/${ubuntu_release}/${ubuntu_package}"
+	local curl_output=""
+	local curl_return=""
+	local mypwd=$PWD
+	#get listing of all packages
+	log "INFO: getdeb - downloading ubuntu packageinfo url - ${ubuntu_packageinfo_url}"
+	local curl_output=$(curl -k "${ubuntu_packageinfo_url}")
+	local curl_return=$?
+	if [ $curl_return -ne 0 -o $(echo "${curl_output}" | grep -c "pdownload") -eq 0 ]; then
+		log "ERR: getdeb - could not download ${ubuntu_packageinfo_url}"
+		return 1
+	fi
+	#search for link to the download mirror list
+	#get just the content between the pdownload div tags
+	local ubuntu_packagemirror_url=$(echo "${curl_output}" | grep "<a href"|grep "download"|grep -E "i386|i686|all"|  grep -o '<a href=['"'"'"][^"'"'"']*['"'"'"]' | sed -e 's/^<a href=["'"'"']//' -e 's/["'"'"']$//'|head -n 1)
+	
+	if [ "${ubuntu_packagemirror_url}" == "" ]; then
+		log "ERR: getdeb - could not find packagemirror url"
+		return 1
+	fi
+
+	#get the download mirror url
+	log "INFO: getdeb - downloading ubuntu packagemirror url - ${ubuntu_package_url}${ubuntu_packagemirror_url}"
+	curl_output=$(curl -k "${ubuntu_package_url}${ubuntu_packagemirror_url}")
+	curl_return=$?
+	if [ $curl_return -ne 0 ]; then
+		log "ERR: getdeb - could not download ${ubuntu_package_url}${ubuntu_packagemirror_url}"
+		return 1
+	fi
+	local ubuntu_download_url=$(echo "${curl_output}" | sed -n '/North America/,$p'| sed '/<\/ul>/,$d' |  grep -o '<a href=['"'"'"][^"'"'"']*['"'"'"]' | sed -e 's/^<a href=["'"'"']//' -e 's/["'"'"']$//'|head -n 1)
+	log "INFO: getdeb - ubuntu_download_url=${ubuntu_download_url}"
+	if [ "${ubuntu_download_url}" == "" ]; then
+		log "ERR: getdeb - could not find ubunut package download url"
+		return 1
+	fi
+
+	local ubuntu_package_name=${ubuntu_download_url##*/}
+	log "INFO: getdeb - ubuntu_package_name=${ubuntu_package_name}"
+	if [ "${ubuntu_package_name}" == "" ]; then
+		log "ERR: getdeb - could not determine ubuntu package name from download url"
+		return 1
+	fi
+
+	#download the ubuntu package
+	cd ${download_dir}
+	curl -k -O "${ubuntu_download_url}"
+	cd ${mypwd}
+	if [ $? -ne 0 -o ! -e "${download_dir}/${ubuntu_package_name}" ]; then 
+		log "ERR: getdeb - failed to download ${ubuntu_download_url}"
+		return 1
+	fi
+	echo "${ubuntu_package_name}"
+	return 0
+}
+#function to unpack a deb file with ar (required)
+#Arguments:
+##debdir-string-path to debian unpack directory containing debfile
+##debfile-string-full debian file name of package to be unpacked
+##
+function unpackdeb(){
+	local debdir=$1
+	local debfile=$2
+	local mycwd=$PWD
+	
+	log "INFO: #####unpackdeb ==start#####"
+	
+	#check if debdir exists
+	if [ ! -d "${debdir}" ]; then
+		log "ERR: unpackdeb - debdir ${debdir} does not exist"
+		return 1
+	fi
+
+	#cd into debdir and begin work
+	cd ${debdir}
+
+	#check if debfile exists
+	if [ ! -e "${debfile}" ]; then
+		log "ERR: unpackdeb - debfile ${debfile} does not exist"
+		return 1
+	fi
+
+	#try to unpack file
+	local ar_output=$(ar vx ${debfile})
+	local ar_return=$?
+	if [ ${ar_return} -ne 0 ]; then
+		log "ERR: unpackdeb - unable to ar extract ${debfile}"
+		return 1
+	fi
+	log "INF: unpackdeb - ar extract output:\n${ar_output}"
+
+	#ensure that data.tar.gz from the ar extract exists
+	if [ ! -e "data.tar.gz" ]; then
+		log "ERR: unpackdeb - debfile ${debfile} did not contain the required data.tar.gz"
+		return 1
+	fi
+	#make temporary directory for storing ubuntu binaries
+	if [ ! -d "root" ]; then
+		mkdir root
+	fi
+	local tar_output=$(tar -xzvf data.tar.gz -C root)
+	local tar_return=$?
+
+	if [ ${tar_return} -ne 0 ]; then
+		log "ERR: unpackdeb - unable to extract debfile ${debfile}'s data.tar.gz"
+		return 1
+	fi
+	log "INFO: unpackdeb - data.tar.gz extract output:\n${tar_output}"
+
+	#move root to igel_module_dir
+	log "INFO: unpackdeb - copying root directory to final module directory ${igel_module_dir}"
+	cp -Rf root ${igel_module_dir}
+	if [ $? -ne 0 ]; then
+		log "ERR: unpackdeb - unable to copying root directory to final module directory ${igel_module_dir}"
+	fi
+
+	cd ${mycwd}
+	
+	log "INFO: #####unpackdeb ==end#####"
+	#return without error
+	return 0
+}
+
+#function create_igel_module_dir create final igel module directory
+function create_igel_module_shell(){
+	log "INFO: #####create_igel_module_shell ==start#####"
+	#create the igel module directory
+	if [ ! -d "${igel_module_dir}" ]; then
+		log "INFO: create_igel_module_shell - creating igel_module_dir ${igel_module_dir}"
+		mkdir ${igel_module_dir}
+		if [ $? -ne 0 ]; then
+			log "ERR: create_igel_module_shell - could not create igel_module_dir ${igel_module_dir}"
+			exit 1
+		fi
+	fi
+
+  #create the igel_module inf file
+	log "INFO: create_igel_module_shell - creating igel_module inf file ${igel_module_dir}/${igel_module}.inf"
+  cat <<EOF > "${igel_module_dir}/${igel_module}.inf"
+[INFO]
+[PART]
+file="${igel_module}.tar.bz2"
+version="${igel_module_version}"
+EOF
+	if [ $? -ne 0 ]; then
+		log "ERR: create_igel_module_shell - could not create igel_module inf file ${igel_module_dir}/${igel_module}.inf"
+		exit 1
+	fi
+	log "INFO: #####igel_module_inf ==end#####"
+
+	log "INFO: #####create_igel_module_shell ==end#####"
+}
+############################
+#####MAINPROGRAM==START#####
+#####argument setting==start#####
+#define arguments
+set -- `getopt -n "$progname" -u --longoptions="igel-name:,igel-version:,ubuntu-package:,ubuntu-release:,help" "hcu" "$@"` || usage
+
+while [ $# -gt 0 ]; do
+	#log "getopts \$1=$1"
+	#log "getopts \$2=$2"
+	case "$1" in
+		-h | --help)       usage;;
+		-c)                igel_module_type="c";;
+		-u)                igel_module_type="u";;
+		--igel-name)       igel_module=$2;shift;;
+		--igel-version)    igel_module_version=$2;shift;;
+		--ubuntu-package)  ubuntu_package=$2;shift;;
+		--ubuntu-release)  ubuntu_release=$2;shift;;
+		--)                shift;break;;
+		-*)
+											 usage
+											 #unknown arugment supplied
+		;;
+		*)                 break;;
+	esac
+	shift
+done
+#####argument setting==end#####
+
+#####sanity checks==start#####
+#check for igel_module_type for c or u
+log "INFO: igel_module_type=${igel_module_type}"
+if [ -z "${igel_module_type}" ]; then
+	log "ERR: -c|-u not found required option"
+	usage
+fi
+#check for igel_module name
+log "INFO: igel_module=${igel_module}"
+if [ -z "${igel_module}" ]; then
+	log "ERR: --igel-name option required"
+	usage
+fi
+#check for igel_module version
+log "INFO: igel_module_version=${igel_module_version}"
+if [ -z ${igel_module_version} ]; then
+	log "ERR: --igel-version option required"
+	usage
+fi
+#if igel_module_type is u (for ubuntu) check for ubuntu_package and ubuntu_release
+if [ "${igel_module_type}" == "u" ]; then
+	log "INFO: ubuntu_package=${ubuntu_package}"
+	log "INFO: ubuntu_release=${ubuntu_release}"
+	if [ -z "${ubuntu_package}" -o -z "${ubuntu_release}" ]; then
+		log "ERR: --ubuntu-name and --ubuntu-release options required with -u"
+		usage
+	fi
+fi
+
+#check for curl ar 
+if [ $(which curl > /dev/null 2>&1;echo $?) -ne 0 -o $(which ar > /dev/null 2>&1;echo $?) -ne 0 ]; then
+	log "ERR: This script requires the curl and ar utility"
+	usage
+fi
+#####sanity checks==end#####
+igel_module_dir="${PWD}/${igel_module}"
+
+#trap ctrl-c
+trap igel_ubuntu_module_cleanup SIGINT
+
+create_igel_module_shell
+if [ "${igel_module_type}" == "u" ]; then
+	igel_ubuntu_module "${ubuntu_package}" "${ubuntu_release}"
+fi
+
+#####MAINPROGRAM==END#####
+##########################
